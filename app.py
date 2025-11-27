@@ -3,46 +3,40 @@ import pandas as pd
 import requests
 import re
 
-# --- 1. 页面配置 ---
 st.set_page_config(page_title="币安 Alpha 监控系统", layout="wide")
-st.title("🛡️ 币安 Alpha 代币稳定度监控")
+st.title("🛡️ 币安 Alpha 代币稳定度监控 (宽容搜索版)")
 
-# --- 2. 侧边栏设置 ---
+# --- 侧边栏 ---
 st.sidebar.header("⚙️ 监控设置")
-
-# 模式选择
 mode = st.sidebar.radio(
     "选择模式：",
     ("🚀 监控所有 USDT 币种", "🎯 仅监控指定币种 (Alpha)")
 )
 
-# 如果选择了“指定币种”，显示输入框
 target_coins = []
 if "仅监控" in mode:
     st.sidebar.markdown("---")
+    st.sidebar.info("💡 提示：如果搜不到，说明该币种可能尚未在币安【现货交易所】上市，属于 Web3 链上币种。")
     user_input = st.sidebar.text_area(
-        "在此粘贴币种名称 (用空格或逗号分开)",
-        value="BTC ETH SOL MERL POPCAT", # 默认示例
-        height=150,
-        help="例如从网页上复制：BTC, ETH, BNB"
+        "在此粘贴币种名称",
+        value="BTC ETH DOGE NEIRO", 
+        height=100
     )
-    # 处理用户输入的文本：将逗号、换行都替换为空格，然后转大写
     clean_input = re.sub(r'[,\n]', ' ', user_input).upper()
     target_coins = [c for c in clean_input.split(' ') if c]
 
 st.sidebar.markdown("---")
-min_vol = st.sidebar.slider("过滤：最小成交额 (百万 USDT)", 0.0, 100.0, 1.0)
+min_vol = st.sidebar.slider("过滤：最小成交额 (百万 USDT)", 0.0, 100.0, 0.0) # 默认设为0以防过滤掉小币
 
-# --- 3. 获取数据函数 (带多节点容灾) ---
+# --- 获取数据 ---
 @st.cache_data(ttl=60)
 def get_binance_data():
     urls = [
-        "https://api.binance.us/api/v3/ticker/24hr", # 美国节点（抗封锁）
+        "https://api.binance.us/api/v3/ticker/24hr",
         "https://api.binance.com/api/v3/ticker/24hr",
         "https://data-api.binance.vision/api/v3/ticker/24hr"
     ]
     status_msg = st.empty()
-    
     for url in urls:
         try:
             response = requests.get(url, timeout=5)
@@ -51,70 +45,74 @@ def get_binance_data():
                 return response.json()
         except:
             continue
-            
-    status_msg.error("无法连接币安接口，请检查网络。")
+    status_msg.error("无法连接数据源")
     return []
 
-# --- 4. 主逻辑 ---
+# --- 主程序 ---
 data = get_binance_data()
 
 if data:
     df = pd.DataFrame(data)
     
-    # 基础清洗：只看 USDT 交易对
-    df = df[df['symbol'].str.endswith('USDT')]
-    
-    # 类型转换
+    # 这里我们先不急着过滤 USDT，保留所有数据以便模糊搜索
+    # 转换数值
     cols = ['lastPrice', 'highPrice', 'lowPrice', 'quoteVolume']
     for c in cols:
         df[c] = pd.to_numeric(df[c])
 
-    # --- 核心逻辑：根据模式筛选 ---
-    if "仅监控" in mode and target_coins:
-        # 构建正则匹配：比如用户输入 "BTC"，我们匹配 "BTCUSDT"
-        # 这里的逻辑是：只要交易对包含用户输入的任何一个词，就保留
-        pattern = '|'.join(target_coins)
-        # 严格匹配：确保是 "BTC" + "USDT"，防止输入 "T" 匹配到 "USDT"
-        # 简单起见，我们筛选 symbol 包含 (用户输入币种 + USDT)
-        
-        filtered_dfs = []
-        for coin in target_coins:
-            # 尝试精准匹配，例如 BTC -> BTCUSDT
-            match = df[df['symbol'] == f"{coin}USDT"]
-            if not match.empty:
-                filtered_dfs.append(match)
-        
-        if filtered_dfs:
-            df = pd.concat(filtered_dfs)
-        else:
-            st.warning(f"⚠️ 未找到您输入的币种数据。请确保这些币（{user_input}）已在币安现货交易上线。")
-            df = pd.DataFrame() # 空表
+    # 结果容器
+    result_df = pd.DataFrame()
 
-    if not df.empty:
-        # 计算波动率
-        df = df[df['lowPrice'] > 0]
-        df['波动率(%)'] = ((df['highPrice'] - df['lowPrice']) / df['lowPrice']) * 100
-        df['成交额(M)'] = df['quoteVolume'] / 1000000
+    if "仅监控" in mode and target_coins:
+        found_frames = []
+        not_found_list = []
+
+        for coin in target_coins:
+            # 1. 尝试精准匹配 USDT 对 (最常用)
+            exact_match = df[df['symbol'] == f"{coin}USDT"]
+            
+            # 2. 如果没找到，尝试“模糊匹配” (包含这个名字的任何对)
+            fuzzy_match = df[df['symbol'].str.contains(coin)]
+            
+            if not exact_match.empty:
+                found_frames.append(exact_match)
+            elif not fuzzy_match.empty:
+                # 如果找到了模糊匹配（比如输入 DOGE 找到了 DOGETRY），也加进去
+                found_frames.append(fuzzy_match)
+            else:
+                not_found_list.append(coin)
         
-        # 应用成交额过滤
-        df_show = df[df['成交额(M)'] >= min_vol].copy()
+        # 显示找不到的名单
+        if not_found_list:
+            st.error(f"❌ 以下币种在币安现货未找到 (可能是 Web3/链上币): {', '.join(not_found_list)}")
+            
+        if found_frames:
+            result_df = pd.concat(found_frames).drop_duplicates()
+    else:
+        # 全量模式，默认只看 USDT
+        result_df = df[df['symbol'].str.endswith('USDT')]
+
+    # --- 展示逻辑 ---
+    if not result_df.empty:
+        # 计算逻辑
+        result_df = result_df[result_df['lowPrice'] > 0]
+        result_df['波动率(%)'] = ((result_df['highPrice'] - result_df['lowPrice']) / result_df['lowPrice']) * 100
+        result_df['成交额(M)'] = result_df['quoteVolume'] / 1000000
         
-        # 排序
-        df_show = df_show.sort_values("波动率(%)")
+        # 再次过滤成交额
+        final_show = result_df[result_df['成交额(M)'] >= min_vol].sort_values("波动率(%)")
         
-        # 显示结果信息
-        st.subheader(f"📊 监控报告：共 {len(df_show)} 个币种")
+        st.subheader(f"📊 监控报告：找到 {len(final_show)} 个交易对")
         
-        # 绘制表格
         st.dataframe(
-            df_show[['symbol', 'lastPrice', '波动率(%)', '成交额(M)']].style.format({
-                "lastPrice": "{:.4f}",
+            final_show[['symbol', 'lastPrice', '波动率(%)', '成交额(M)']].style.format({
+                "lastPrice": "{:.6f}", # 增加小数位，防止小币种显示为0
                 "波动率(%)": "{:.2f}%",
                 "成交额(M)": "{:.2f} M"
             }).background_gradient(subset=['波动率(%)'], cmap='RdYlGn_r'),
             use_container_width=True,
             height=800
         )
-    else:
-        if "仅监控" not in mode:
-            st.warning("数据为空，请检查网络。")
+    elif "仅监控" in mode:
+        st.warning("您输入的币种全都没有找到。")
+
